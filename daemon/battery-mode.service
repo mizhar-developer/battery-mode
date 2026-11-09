@@ -1,0 +1,17 @@
+[Unit]
+Description=Battery charging mode manager (ThinkPad dual battery)
+ConditionPathExists=/sys/class/power_supply/BAT0
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/battery-mode.conf
+ExecStart=/usr/local/bin/battery-mode-daemon
+Restart=on-failure
+RestartSec=5
+Nice=10
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

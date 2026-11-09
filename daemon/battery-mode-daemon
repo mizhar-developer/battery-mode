@@ -1,0 +1,318 @@
+#!/usr/bin/python3
+"""battery-mode: charging modes for a ThinkPad with two batteries.
+
+The mode is one word in /var/lib/battery-mode/mode:
+  off      Leave the current firmware limits alone; no logic runs.
+  full     Both batteries: firmware default start, stop at 100%, charging allowed.
+  default  Both batteries: start below 5%, stop at 80%, charging allowed.
+  plan     Nothing charges until Battery 1 (BAT0) is at 5% or less. Then Battery 1
+           charges to 80% while Battery 2 (BAT1) is held off, then Battery 2 charges
+           to 80%, then both are held off again until Battery 1 is back at 5%.
+           Holding off is done with a 1/5 threshold pair, charging with 79/80.
+
+Status for the panel widget is written to /var/lib/battery-mode/status.json.
+
+Environment (set by the installer in /etc/battery-mode.conf):
+  BATTERY_MODE_OWNER   desktop user who may change the mode (owns the mode file)
+  BATTERY_MODE_SYSFS   power_supply directory, for tests with a fake sysfs
+  BATTERY_MODE_DIR     state directory
+  BATTERY_MODE_POLL    poll interval in seconds
+"""
+import json
+import os
+import pwd
+import signal
+import sys
+import time
+
+SYSFS = os.environ.get("BATTERY_MODE_SYSFS", "/sys/class/power_supply")
+STATE_DIR = os.environ.get("BATTERY_MODE_DIR", "/var/lib/battery-mode")
+POLL = float(os.environ.get("BATTERY_MODE_POLL", "3"))
+MODE_FILE = os.path.join(STATE_DIR, "mode")
+STATE_FILE = os.path.join(STATE_DIR, "plan-state")
+STATUS_FILE = os.path.join(STATE_DIR, "status.json")
+OWNER = os.environ.get("BATTERY_MODE_OWNER", "")
+
+FIRST, SECOND, AC = "BAT0", "BAT1", "AC"  # BAT0 = internal = "Battery 1", BAT1 = rear = "Battery 2"
+LOW, HIGH = 5, 80
+TOPUP_START = HIGH - 1  # start threshold that makes the firmware charge a battery up to HIGH now
+PARK = (1, 5)  # threshold pair that keeps a battery from charging (only a battery at 0% would creep to 5%)
+# Why thresholds and not charge_behaviour for the plan: on the ThinkPad T550 the firmware cannot block
+# Battery 2 (BAT1) on its own, and blocking BAT0 blocks both. Per-battery thresholds work reliably.
+MODES = ("off", "full", "default", "plan")
+PLAN_STATES = ("wait", "charge1", "charge2")
+RELAXED_POLLS = 3  # consecutive polls a "stopped a hair below 80%" reading must hold
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def sysfs_read(*parts):
+    try:
+        with open(os.path.join(SYSFS, *parts)) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def sysfs_write(value, *parts):
+    path = os.path.join(SYSFS, *parts)
+    try:
+        with open(path, "w") as f:
+            f.write(str(value))
+        return True
+    except OSError as e:
+        log(f"write {value!r} to {path} failed: {e}")
+        return False
+
+
+def read_int(*parts):
+    v = sysfs_read(*parts)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def behaviour(bat):
+    raw = sysfs_read(bat, "charge_behaviour") or ""
+    if "[" in raw:
+        return raw.split("[", 1)[1].split("]", 1)[0]
+    return raw.strip()
+
+
+def battery(bat):
+    return {
+        "present": read_int(bat, "present") == 1,
+        "capacity": read_int(bat, "capacity"),
+        "status": sysfs_read(bat, "status"),
+        "behaviour": behaviour(bat),
+        "start": read_int(bat, "charge_control_start_threshold"),
+        "stop": read_int(bat, "charge_control_end_threshold"),
+    }
+
+
+def ac_online():
+    return read_int(AC, "online") == 1
+
+
+def set_thresholds(bat, start, stop):
+    cur_start = read_int(bat, "charge_control_start_threshold")
+    cur_stop = read_int(bat, "charge_control_end_threshold")
+    if cur_start == start and cur_stop == stop:
+        return
+    # The kernel rejects start > current stop and stop < current start, so order matters.
+    if start > (cur_stop if cur_stop is not None else 100):
+        order = [("charge_control_end_threshold", stop), ("charge_control_start_threshold", start)]
+    else:
+        order = [("charge_control_start_threshold", start), ("charge_control_end_threshold", stop)]
+    for name, val in order:
+        if read_int(bat, name) != val:
+            sysfs_write(val, bat, name)
+    log(f"{bat}: thresholds {cur_start}/{cur_stop} -> {start}/{stop}")
+
+
+def set_behaviour(bat, want):
+    if behaviour(bat) != want and sysfs_write(want, bat, "charge_behaviour"):
+        log(f"{bat}: charge_behaviour -> {want}")
+
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def write_text(path, text, mode=0o644):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def ensure_mode_file():
+    """Create the mode file and let the configured desktop user write to it."""
+    if not os.path.exists(MODE_FILE):
+        write_text(MODE_FILE, "off", 0o664)
+    if not OWNER:
+        return
+    try:
+        pw = pwd.getpwnam(OWNER)
+        os.chown(MODE_FILE, pw.pw_uid, pw.pw_gid)
+        os.chmod(MODE_FILE, 0o664)
+    except (KeyError, OSError) as e:
+        log(f"cannot hand the mode file to user {OWNER!r}: {e}")
+
+
+_bad_mode_logged = None
+
+
+def read_mode():
+    global _bad_mode_logged
+    raw = read_text(MODE_FILE)
+    mode = (raw or "off").lower()
+    if mode not in MODES:
+        if _bad_mode_logged != raw:
+            log(f"mode file contains {raw!r}, treating as 'off'")
+            _bad_mode_logged = raw
+        return "off"
+    return mode
+
+
+def is_low(b):
+    return b["present"] and b["capacity"] is not None and b["capacity"] <= LOW
+
+
+def is_done(b, relaxed):
+    """True once the battery reached HIGH. The firmware may stop a point or two early,
+    so a steady 'Not charging' near HIGH also counts after a few polls."""
+    if not b["present"]:
+        return True, 0
+    cap = b["capacity"]
+    if cap is None:
+        return False, 0
+    if cap >= HIGH:
+        return True, 0
+    if cap >= HIGH - 2 and b["status"] in ("Not charging", "Full") and b["behaviour"] == "auto":
+        relaxed += 1
+        return relaxed >= RELAXED_POLLS, relaxed
+    return False, 0
+
+
+def fresh_plan_state(first):
+    return "charge1" if is_low(first) else "wait"
+
+
+def plan_step(state, first, second, relaxed):
+    prev = state
+    if state == "wait":
+        if is_low(first):
+            state = "charge1"
+    elif state == "charge1":
+        done, relaxed = is_done(first, relaxed)
+        if done:
+            state, relaxed = "charge2", 0
+    elif state == "charge2":
+        done, relaxed = is_done(second, relaxed)
+        if done:
+            state, relaxed = "wait", 0
+    if state != prev:
+        log(f"plan: {prev} -> {state} (BAT0 {first['capacity']}%, BAT1 {second['capacity']}%)")
+        write_text(STATE_FILE, state)
+
+    if state == "wait":
+        limits = {FIRST: PARK, SECOND: PARK}
+    elif state == "charge1":
+        limits = {FIRST: (TOPUP_START, HIGH), SECOND: PARK}
+    else:
+        limits = {FIRST: (LOW, HIGH), SECOND: (TOPUP_START, HIGH)}
+    for bat, b in ((FIRST, first), (SECOND, second)):
+        if not b["present"]:
+            continue
+        set_thresholds(bat, *limits[bat])
+        set_behaviour(bat, "auto")  # the plan never uses the firmware block; clear any leftover
+    return state, relaxed
+
+
+def describe(mode, state, first, second, ac):
+    c0, c1 = first["capacity"], second["capacity"]
+    if mode == "off":
+        return f"Off: keeping current limits (Battery 1 {first['start']}-{first['stop']}%, Battery 2 {second['start']}-{second['stop']}%)"
+    if mode == "full":
+        return "Full charge: both batteries charge to 100%"
+    if mode == "default":
+        return f"Default: each battery charges between {LOW}% and {HIGH}%"
+    if state == "wait":
+        return f"Plan: waiting for Battery 1 to reach {LOW}% (now {c0}%), charging held off"
+    if state == "charge1":
+        return f"Plan: charging Battery 1 to {HIGH}% (now {c0}%), Battery 2 held off"
+    return f"Plan: charging Battery 2 to {HIGH}% (now {c1}%)"
+
+
+def main():
+    once = "--once" in sys.argv
+    stopping = False
+
+    def on_signal(*_):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    ensure_mode_file()
+    current_mode = None
+    plan_state = None
+    relaxed = 0
+    last_status = None
+    last_status_time = 0
+    log(f"battery-mode starting (sysfs={SYSFS}, dir={STATE_DIR})")
+
+    while not stopping:
+        mode = read_mode()
+        first, second, ac = battery(FIRST), battery(SECOND), ac_online()
+
+        if mode != current_mode:
+            log(f"mode: {current_mode} -> {mode}")
+            if current_mode == "plan":
+                # leaving the plan: restore the 5-80 limits as the resting state, nothing blocked
+                for bat, b in ((FIRST, first), (SECOND, second)):
+                    if b["present"]:
+                        set_behaviour(bat, "auto")
+                        set_thresholds(bat, LOW, HIGH)
+                try:
+                    os.remove(STATE_FILE)
+                except OSError:
+                    pass
+                plan_state = None
+            if mode == "plan":
+                saved = read_text(STATE_FILE) if current_mode is None else None  # resume only across a restart
+                plan_state = saved if saved in PLAN_STATES else fresh_plan_state(first)
+                relaxed = 0
+                write_text(STATE_FILE, plan_state)
+                log(f"plan: state {plan_state}" + (" (resumed)" if saved else ""))
+            current_mode = mode
+
+        if mode == "full":
+            for bat, b in ((FIRST, first), (SECOND, second)):
+                if b["present"]:
+                    set_thresholds(bat, 0, 100)
+                    set_behaviour(bat, "auto")
+        elif mode == "default":
+            for bat, b in ((FIRST, first), (SECOND, second)):
+                if b["present"]:
+                    set_thresholds(bat, LOW, HIGH)
+                    set_behaviour(bat, "auto")
+        elif mode == "plan":
+            plan_state, relaxed = plan_step(plan_state, first, second, relaxed)
+
+        # re-read so the status reflects what was just applied
+        first, second = battery(FIRST), battery(SECOND)
+        status = {
+            "mode": mode,
+            "plan_state": plan_state,
+            "ac": ac,
+            "batteries": {FIRST: first, SECOND: second},
+            "message": describe(mode, plan_state, first, second, ac),
+        }
+        now = time.time()
+        if status != last_status or now - last_status_time > 30:
+            write_text(STATUS_FILE, json.dumps({**status, "updated": int(now)}))
+            last_status, last_status_time = status, now
+
+        if once:
+            break
+        slept = 0.0
+        while slept < POLL and not stopping:
+            time.sleep(0.5)
+            slept += 0.5
+    log("battery-mode stopping")
+
+
+if __name__ == "__main__":
+    main()

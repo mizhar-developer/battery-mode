@@ -1,0 +1,22 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Mizhar"
+            }
+        ],
+        "BugReportUrl": "https://github.com/mizhar-developer/battery-mode/issues",
+        "Category": "System Information",
+        "Description": "Charging modes for ThinkPads with two batteries: full charge, 5-80% limits, or a sequential plan. Needs the small battery-mode background service from the project page.",
+        "Icon": "battery",
+        "Id": "io.github.mizhar-developer.batterymode",
+        "License": "MIT",
+        "Name": "Battery Mode",
+        "Version": "1.0.0",
+        "Website": "https://github.com/mizhar-developer/battery-mode"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "Hardware"
+}
